@@ -37,6 +37,17 @@ pub enum Commands {
         to: Option<String>,
     },
 
+    /// Send text/message to a peer
+    Text {
+        /// The text message to send
+        #[arg(required = true)]
+        message: String,
+
+        /// Target peer name or index (optional, will prompt if not provided)
+        #[arg(short, long)]
+        to: Option<String>,
+    },
+
     /// Start receiving mode (listen for incoming transfers)
     Receive {
         /// Download directory for received files
