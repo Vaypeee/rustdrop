@@ -1,0 +1,39 @@
+[package]
+name = "rustdrop"
+version = "0.1.0"
+edition = "2024"
+authors = ["Amine"]
+description = "Alternative locale à AirDrop - Transfert de fichiers en CLI"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Sérialisation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# TLS / Sécurité
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2"
+rcgen = "0.13"
+
+# Réseau
+socket2 = { version = "0.5", features = ["all"] }
+
+# Utilitaires
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+directories = "6.0"
+hostname = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.14"
