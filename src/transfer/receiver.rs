@@ -198,7 +198,74 @@ async fn receive_file(
         request.filename, received
     );
 
+    // If it's a text message, display it in the terminal
+    if request.filename == "rustdrop_message.txt" {
+        if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
+            display_text_message(&content, &request.sender_name, &file_path);
+        }
+    }
+
     Ok(())
+}
+
+const MAX_DISPLAY_LINES: usize = 10;
+
+/// Display a text message in the terminal with formatting
+fn display_text_message(content: &str, sender: &str, file_path: &PathBuf) {
+    println!("\n{}", "─".repeat(50));
+    println!("📨 Message from {}:", sender);
+    println!("{}", "─".repeat(50));
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    // Display limited lines
+    for line in lines.iter().take(MAX_DISPLAY_LINES) {
+        let displayed = make_links_clickable(line);
+        println!("{}", displayed);
+    }
+
+    if total_lines > MAX_DISPLAY_LINES {
+        println!("\n... ({} lignes supplémentaires)", total_lines - MAX_DISPLAY_LINES);
+        println!("📄 Fichier complet: {:?}", file_path);
+    }
+
+    println!("{}", "─".repeat(50));
+
+    // Extract URLs and copy to clipboard
+    let urls = extract_urls(content);
+    if !urls.is_empty() {
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let to_copy = if urls.len() == 1 {
+                urls[0].clone()
+            } else {
+                urls.join("\n")
+            };
+
+            if clipboard.set_text(&to_copy).is_ok() {
+                println!("📋 Copié dans le presse-papier: {}",
+                    if urls.len() == 1 { &urls[0] } else { "(plusieurs liens)" });
+            }
+        }
+    }
+}
+
+/// Make URLs clickable in terminal using OSC 8 escape sequence
+fn make_links_clickable(text: &str) -> String {
+    let url_pattern = regex_lite::Regex::new(r"(https?://[^\s]+)").unwrap();
+    url_pattern.replace_all(text, |caps: &regex_lite::Captures| {
+        let url = &caps[1];
+        // OSC 8 hyperlink format: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
+        format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, url)
+    }).to_string()
+}
+
+/// Extract all URLs from text
+fn extract_urls(text: &str) -> Vec<String> {
+    let url_pattern = regex_lite::Regex::new(r"(https?://[^\s]+)").unwrap();
+    url_pattern.find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 /// Get a unique file path, appending (1), (2), etc. if file exists
