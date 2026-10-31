@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 certs/*.pem
 *.swp
 *.swo

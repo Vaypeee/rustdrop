@@ -1,11 +1,15 @@
 use crate::error::{Result, RustDropError};
-use crate::security::identity::Identity;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig, ServerConfig};
+use crate::security::identity::{Identity, fingerprint_from_der};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme,
+};
 use rustls_pemfile::{certs, private_key};
 use std::io::BufReader;
 use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tracing::debug;
 
 /// Create a TLS acceptor (server) from identity
 pub fn create_tls_acceptor(identity: &Identity) -> Result<TlsAcceptor> {
@@ -20,12 +24,21 @@ pub fn create_tls_acceptor(identity: &Identity) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Create a TLS connector (client) that accepts any certificate
-/// Note: In production, you'd want to verify the peer's fingerprint
-pub fn create_tls_connector() -> Result<TlsConnector> {
+/// Create a TLS connector that pins the peer's certificate fingerprint.
+///
+/// Peers use self-signed certificates, so there is no CA chain to walk. Instead
+/// we trust the SHA-256 fingerprint the peer broadcast over UDP discovery: the
+/// handshake only succeeds if the certificate presented hashes to that value and
+/// the peer proves possession of the matching private key.
+pub fn create_tls_connector(expected_fingerprint: &str) -> Result<TlsConnector> {
+    let verifier = PinnedCertVerifier {
+        expected_fingerprint: expected_fingerprint.to_ascii_lowercase(),
+        provider: Arc::new(rustls::crypto::ring::default_provider()),
+    };
+
     let config = ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
 
     Ok(TlsConnector::from(Arc::new(config)))
@@ -34,9 +47,7 @@ pub fn create_tls_connector() -> Result<TlsConnector> {
 /// Load certificates from PEM string
 fn load_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     let mut reader = BufReader::new(pem.as_bytes());
-    let certs: Vec<CertificateDer<'static>> = certs(&mut reader)
-        .filter_map(|r| r.ok())
-        .collect();
+    let certs: Vec<CertificateDer<'static>> = certs(&mut reader).filter_map(|r| r.ok()).collect();
 
     if certs.is_empty() {
         return Err(RustDropError::Certificate("No certificates found".into()));
@@ -54,55 +65,69 @@ fn load_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| RustDropError::Certificate("No private key found".into()))
 }
 
-/// Certificate verifier that accepts any certificate
-/// This is used because we're using self-signed certificates
-/// The actual verification is done by comparing fingerprints
+/// Accepts exactly one self-signed certificate: the one whose SHA-256
+/// fingerprint matches the value announced by the peer we meant to reach.
 #[derive(Debug)]
-struct InsecureCertVerifier;
+struct PinnedCertVerifier {
+    expected_fingerprint: String,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
 
-impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
+impl ServerCertVerifier for PinnedCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // Accept any certificate - we verify via fingerprint comparison
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        let presented = fingerprint_from_der(end_entity);
+
+        if presented == self.expected_fingerprint {
+            debug!("Peer certificate matches pinned fingerprint");
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ))
+        }
     }
 
+    // The fingerprint only proves which certificate was presented; certificates
+    // are public, so we still let rustls check the handshake signature to prove
+    // the peer actually holds the matching private key.
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

@@ -10,7 +10,7 @@ use crate::config::Settings;
 use crate::error::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 use uuid::Uuid;
 
 /// Discovery service that manages both announcer and listener

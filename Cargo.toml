@@ -3,7 +3,7 @@ name = "rustdrop"
 version = "0.1.0"
 edition = "2024"
 authors = ["Amine"]
-description = "Alternative locale à AirDrop - Transfert de fichiers en CLI"
+description = "AirDrop-style file transfer over the local network"
 license = "MIT"
 
 [dependencies]
@@ -22,6 +22,7 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 rcgen = "0.13"
+sha2 = "0.10"
 
 # Réseau
 socket2 = { version = "0.5", features = ["all"] }
@@ -39,3 +40,13 @@ arboard = "3.4"              # Clipboard support
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.14"
+
+# Integration tests live in tests/integration/, which Cargo does not pick up
+# automatically: only tests/*.rs are auto-discovered.
+[[test]]
+name = "discovery"
+path = "tests/integration/discovery_test.rs"
+
+[[test]]
+name = "transfer"
+path = "tests/integration/transfer_test.rs"

@@ -1,14 +1,14 @@
 use crate::config::Settings;
 use crate::error::{Result, RustDropError};
-use crate::security::{create_tls_acceptor, Identity};
-use crate::transfer::protocol::{Message, ProtocolError, TransferRequest};
-use std::path::PathBuf;
+use crate::security::{Identity, create_tls_acceptor};
+use crate::transfer::protocol::{Message, ProtocolError, TextMessage, TransferRequest, read_chunk};
+use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_rustls::server::TlsStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// File transfer receiver (server)
 pub struct Receiver {
@@ -28,13 +28,10 @@ impl Receiver {
 
     /// Start the receiver server
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", self.settings.transfer_port))
-            .await?;
+        let listener =
+            TcpListener::bind(format!("0.0.0.0:{}", self.settings.transfer_port)).await?;
 
-        info!(
-            "Receiver listening on port {}",
-            self.settings.transfer_port
-        );
+        info!("Receiver listening on port {}", self.settings.transfer_port);
 
         let acceptor = create_tls_acceptor(&self.identity)?;
 
@@ -78,61 +75,118 @@ async fn handle_connection(
     settings: &Settings,
     auto_accept: bool,
 ) -> Result<()> {
-    // TLS handshake
-    let mut tls_stream = acceptor.accept(stream).await.map_err(|e| {
-        RustDropError::Tls(format!("TLS accept failed: {}", e))
-    })?;
+    let mut tls_stream = acceptor
+        .accept(stream)
+        .await
+        .map_err(|e| RustDropError::Tls(format!("TLS accept failed: {}", e)))?;
 
     debug!("TLS handshake complete");
 
-    // Read transfer request
     let msg = Message::read_from(&mut tls_stream)
         .await
         .map_err(protocol_to_rustdrop)?;
 
-    let request = match msg {
-        Message::TransferRequest(req) => req,
+    match msg {
+        Message::TransferRequest(request) => {
+            handle_file_transfer(&mut tls_stream, request, settings, auto_accept).await
+        }
+        Message::TextMessage(message) => {
+            handle_text_message(&mut tls_stream, message, auto_accept).await
+        }
         _ => {
             let error = Message::TransferError {
-                message: "Expected TransferRequest".into(),
+                message: "Expected TransferRequest or TextMessage".into(),
             };
             let _ = error.write_to(&mut tls_stream).await;
-            return Err(RustDropError::Transfer("Unexpected message".into()));
+            Err(RustDropError::Transfer("Unexpected message".into()))
         }
-    };
+    }
+}
 
+async fn handle_file_transfer(
+    tls_stream: &mut TlsStream<TcpStream>,
+    request: TransferRequest,
+    settings: &Settings,
+    auto_accept: bool,
+) -> Result<()> {
     info!(
-        "Transfer request: '{}' ({} bytes) from '{}'",
-        request.filename, request.file_size, request.sender_name
+        "Transfer request: '{}' ({}) from '{}'",
+        request.filename,
+        format_size(request.file_size),
+        request.sender_name
     );
 
-    // Accept or reject (auto-accept for now, could prompt user)
-    let accepted = if auto_accept {
-        info!("Auto-accepting transfer");
-        true
-    } else {
-        // In a real app, you'd prompt the user here
-        info!("Auto-accepting transfer (interactive mode not implemented)");
-        true
-    };
+    let prompt = format!(
+        "Accept '{}' ({}) from '{}'?",
+        request.filename,
+        format_size(request.file_size),
+        request.sender_name
+    );
 
-    if !accepted {
+    if !confirm(&prompt, auto_accept).await {
+        info!("Transfer declined");
         Message::TransferReject {
             reason: "User declined".into(),
         }
-        .write_to(&mut tls_stream)
+        .write_to(tls_stream)
         .await
         .map_err(protocol_to_rustdrop)?;
         return Ok(());
     }
 
     Message::TransferAccept
-        .write_to(&mut tls_stream)
+        .write_to(tls_stream)
         .await
         .map_err(protocol_to_rustdrop)?;
 
-    // Receive file
-    receive_file(&mut tls_stream, &request, &settings.download_dir).await?;
+    // Confirm (or report failure) so the sender knows the file is committed
+    match receive_file(tls_stream, &request, &settings.download_dir).await {
+        Ok(()) => {
+            Message::TransferComplete
+                .write_to(tls_stream)
+                .await
+                .map_err(protocol_to_rustdrop)?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = Message::TransferError {
+                message: e.to_string(),
+            }
+            .write_to(tls_stream)
+            .await;
+            Err(e)
+        }
+    }
+}
+
+async fn handle_text_message(
+    tls_stream: &mut TlsStream<TcpStream>,
+    message: TextMessage,
+    auto_accept: bool,
+) -> Result<()> {
+    let prompt = format!("Accept a message from '{}'?", message.sender_name);
+
+    if !confirm(&prompt, auto_accept).await {
+        Message::TransferReject {
+            reason: "User declined".into(),
+        }
+        .write_to(tls_stream)
+        .await
+        .map_err(protocol_to_rustdrop)?;
+        return Ok(());
+    }
+
+    Message::TransferAccept
+        .write_to(tls_stream)
+        .await
+        .map_err(protocol_to_rustdrop)?;
+
+    display_text_message(&message.text, &message.sender_name);
+
+    Message::TransferComplete
+        .write_to(tls_stream)
+        .await
+        .map_err(protocol_to_rustdrop)?;
 
     Ok(())
 }
@@ -140,12 +194,11 @@ async fn handle_connection(
 async fn receive_file(
     stream: &mut TlsStream<TcpStream>,
     request: &TransferRequest,
-    download_dir: &PathBuf,
+    download_dir: &Path,
 ) -> Result<()> {
-    // Create download directory if needed
     tokio::fs::create_dir_all(download_dir).await?;
 
-    // Create unique filename to avoid overwriting
+    // Pick a name that does not clobber an existing download
     let file_path = get_unique_path(download_dir, &request.filename).await;
 
     info!("Saving to {:?}", file_path);
@@ -155,146 +208,194 @@ async fn receive_file(
     let mut last_progress = 0;
 
     loop {
-        let msg = Message::read_from(stream)
-            .await
-            .map_err(protocol_to_rustdrop)?;
-
-        match msg {
-            Message::FileData(data) => {
-                file.write_all(&data.data).await?;
-                received += data.data.len() as u64;
-
-                // Progress reporting
-                if request.file_size > 0 {
-                    let progress = (received * 100 / request.file_size) as u8;
-                    if progress > last_progress && progress % 10 == 0 {
-                        info!("Received {}%", progress);
-                        last_progress = progress;
-                    }
-                }
-
-                if data.is_last {
-                    break;
-                }
+        match read_chunk(stream).await {
+            Ok(Some(chunk)) => {
+                file.write_all(&chunk).await?;
+                received += chunk.len() as u64;
+                report_progress(received, request.file_size, &mut last_progress);
             }
-            Message::TransferComplete => {
-                break;
-            }
-            Message::TransferError { message } => {
-                // Clean up partial file
+            Ok(None) => break,
+            Err(e) => {
+                // Do not leave a half-written file behind
+                drop(file);
                 let _ = tokio::fs::remove_file(&file_path).await;
-                return Err(RustDropError::Transfer(message));
-            }
-            _ => {
-                warn!("Unexpected message during transfer");
+                return Err(protocol_to_rustdrop(e));
             }
         }
     }
 
     file.flush().await?;
 
-    info!(
-        "File '{}' received successfully ({} bytes)",
-        request.filename, received
-    );
-
-    // If it's a text message, display it in the terminal
-    if request.filename == "rustdrop_message.txt" {
-        if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
-            display_text_message(&content, &request.sender_name, &file_path);
-        }
+    if received != request.file_size {
+        drop(file);
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return Err(RustDropError::Transfer(format!(
+            "Incomplete transfer: expected {} bytes, got {}",
+            request.file_size, received
+        )));
     }
 
+    info!(
+        "File '{}' received successfully ({})",
+        request.filename,
+        format_size(received)
+    );
+
     Ok(())
+}
+
+/// Ask the user to confirm, unless running with --accept-all.
+///
+/// Reading a line blocks, so it goes on the blocking pool rather than stalling
+/// the runtime while other transfers are in flight.
+async fn confirm(prompt: &str, auto_accept: bool) -> bool {
+    if auto_accept {
+        info!("Auto-accepting ({})", prompt);
+        return true;
+    }
+
+    let prompt = prompt.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::{self, Write};
+
+        print!("\n{} [y/N] ", prompt);
+        let _ = io::stdout().flush();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return false;
+        }
+
+        matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+    })
+    .await
+    .unwrap_or(false)
 }
 
 const MAX_DISPLAY_LINES: usize = 10;
 
 /// Display a text message in the terminal with formatting
-fn display_text_message(content: &str, sender: &str, file_path: &PathBuf) {
-    println!("\n{}", "─".repeat(50));
-    println!("📨 Message from {}:", sender);
-    println!("{}", "─".repeat(50));
+fn display_text_message(content: &str, sender: &str) {
+    let rule = "-".repeat(50);
+
+    println!("\n{}", rule);
+    println!("Message from {}:", sender);
+    println!("{}", rule);
 
     let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
 
-    // Display limited lines
     for line in lines.iter().take(MAX_DISPLAY_LINES) {
-        let displayed = make_links_clickable(line);
-        println!("{}", displayed);
+        println!("{}", make_links_clickable(line));
     }
 
-    if total_lines > MAX_DISPLAY_LINES {
-        println!("\n... ({} lignes supplémentaires)", total_lines - MAX_DISPLAY_LINES);
-        println!("📄 Fichier complet: {:?}", file_path);
+    if lines.len() > MAX_DISPLAY_LINES {
+        println!("\n... ({} more lines)", lines.len() - MAX_DISPLAY_LINES);
     }
 
-    println!("{}", "─".repeat(50));
+    println!("{}", rule);
 
-    // Extract URLs and copy to clipboard
+    copy_urls_to_clipboard(content);
+}
+
+/// Copy any URLs found in the message to the clipboard
+fn copy_urls_to_clipboard(content: &str) {
     let urls = extract_urls(content);
-    if !urls.is_empty() {
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let to_copy = if urls.len() == 1 {
-                urls[0].clone()
-            } else {
-                urls.join("\n")
-            };
+    if urls.is_empty() {
+        return;
+    }
 
-            if clipboard.set_text(&to_copy).is_ok() {
-                println!("📋 Copié dans le presse-papier: {}",
-                    if urls.len() == 1 { &urls[0] } else { "(plusieurs liens)" });
-            }
+    if let Ok(mut clipboard) = arboard::Clipboard::new()
+        && clipboard.set_text(urls.join("\n")).is_ok()
+    {
+        if urls.len() == 1 {
+            println!("Copied to clipboard: {}", urls[0]);
+        } else {
+            println!("Copied {} links to clipboard", urls.len());
         }
     }
 }
 
-/// Make URLs clickable in terminal using OSC 8 escape sequence
+/// Make URLs clickable in terminal using OSC 8 escape sequences
 fn make_links_clickable(text: &str) -> String {
-    let url_pattern = regex_lite::Regex::new(r"(https?://[^\s]+)").unwrap();
-    url_pattern.replace_all(text, |caps: &regex_lite::Captures| {
-        let url = &caps[1];
-        // OSC 8 hyperlink format: \x1b]8;;URL\x1b\\TEXT\x1b]8;;\x1b\\
-        format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, url)
-    }).to_string()
+    url_pattern()
+        .replace_all(text, |caps: &regex_lite::Captures| {
+            let url = &caps[1];
+            format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, url)
+        })
+        .to_string()
 }
 
 /// Extract all URLs from text
 fn extract_urls(text: &str) -> Vec<String> {
-    let url_pattern = regex_lite::Regex::new(r"(https?://[^\s]+)").unwrap();
-    url_pattern.find_iter(text)
+    url_pattern()
+        .find_iter(text)
         .map(|m| m.as_str().to_string())
         .collect()
 }
 
-/// Get a unique file path, appending (1), (2), etc. if file exists
-async fn get_unique_path(dir: &PathBuf, filename: &str) -> PathBuf {
+fn url_pattern() -> regex_lite::Regex {
+    regex_lite::Regex::new(r"(https?://[^\s]+)").expect("URL pattern is a valid regex")
+}
+
+/// Log transfer progress every 10%
+fn report_progress(done: u64, total: u64, last_progress: &mut u8) {
+    if total == 0 {
+        return;
+    }
+
+    let progress = (done * 100 / total) as u8;
+    if progress > *last_progress && progress.is_multiple_of(10) {
+        info!("Received {}%", progress);
+        *last_progress = progress;
+    }
+}
+
+/// Human-readable byte count
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+
+    let mut size = bytes as f64;
+    let mut unit = 0;
+
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit])
+    }
+}
+
+/// Get a unique file path, appending (1), (2), etc. if the file exists
+async fn get_unique_path(dir: &Path, filename: &str) -> PathBuf {
     let base_path = dir.join(filename);
 
     if !base_path.exists() {
         return base_path;
     }
 
-    let stem = std::path::Path::new(filename)
+    let stem = Path::new(filename)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| filename.to_string());
 
-    let extension = std::path::Path::new(filename)
+    let extension = Path::new(filename)
         .extension()
         .map(|s| format!(".{}", s.to_string_lossy()))
         .unwrap_or_default();
 
     for i in 1..1000 {
-        let new_name = format!("{} ({}){}", stem, i, extension);
-        let new_path = dir.join(&new_name);
+        let new_path = dir.join(format!("{} ({}){}", stem, i, extension));
         if !new_path.exists() {
             return new_path;
         }
     }
 
-    // Fallback: use timestamp
+    // Fallback: timestamp suffix
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

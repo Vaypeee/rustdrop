@@ -1,10 +1,10 @@
-use crate::config::{Settings, ANNOUNCE_INTERVAL_SECS};
+use crate::config::{ANNOUNCE_INTERVAL_SECS, Settings};
 use crate::discovery::peer::Announcement;
 use crate::error::Result;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -38,10 +38,8 @@ impl Announcer {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.set_broadcast(true)?;
 
-        let broadcast_addr = SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::BROADCAST,
-            self.discovery_port,
-        ));
+        let broadcast_addr =
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, self.discovery_port));
 
         let message = serde_json::to_vec(&self.announcement)?;
 

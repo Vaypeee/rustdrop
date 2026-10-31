@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::sync::{RwLock, watch};
+use tokio::time::{Duration, interval};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -141,9 +141,9 @@ fn create_listener_socket(port: u16) -> Result<std::net::UdpSocket> {
         .set_reuse_port(true)
         .map_err(|e| RustDropError::Network(format!("Failed to set SO_REUSEPORT: {}", e)))?;
 
-    socket.set_nonblocking(true).map_err(|e| {
-        RustDropError::Network(format!("Failed to set non-blocking: {}", e))
-    })?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| RustDropError::Network(format!("Failed to set non-blocking: {}", e)))?;
 
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     socket

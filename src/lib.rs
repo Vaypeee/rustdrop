@@ -13,4 +13,4 @@ pub use config::Settings;
 pub use discovery::{DiscoveryService, Peer};
 pub use error::{Result, RustDropError};
 pub use security::Identity;
-pub use transfer::{send_file, Receiver};
+pub use transfer::{Receiver, send_file, send_text};
