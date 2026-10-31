@@ -33,10 +33,14 @@ pub fn test_receiver(name: &str, port: u16) -> TestReceiver {
     }
 }
 
-/// Create a test file of `size` bytes with a repeating byte pattern
-pub async fn create_test_file(dir: &Path, name: &str, size: usize) -> PathBuf {
+/// Create a test file of `size` bytes with a repeating byte pattern, and return
+/// its path along with the exact bytes written.
+///
+/// `fs::write` is deliberate: a `tokio::fs::File` buffers, and dropping it does
+/// not flush, so writing through one and reading the path straight back can
+/// return a short file.
+pub async fn create_test_file(dir: &Path, name: &str, size: usize) -> (PathBuf, Vec<u8>) {
     use tokio::fs;
-    use tokio::io::AsyncWriteExt;
 
     fs::create_dir_all(dir)
         .await
@@ -44,14 +48,11 @@ pub async fn create_test_file(dir: &Path, name: &str, size: usize) -> PathBuf {
     let path = dir.join(name);
 
     let content: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-    let mut file = fs::File::create(&path)
-        .await
-        .expect("Failed to create test file");
-    file.write_all(&content)
+    fs::write(&path, &content)
         .await
         .expect("Failed to write test file");
 
-    path
+    (path, content)
 }
 
 /// Install the rustls crypto provider once per test binary.

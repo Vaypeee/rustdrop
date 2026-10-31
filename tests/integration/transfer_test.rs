@@ -74,8 +74,7 @@ async fn transfers_a_file_larger_than_one_chunk() {
 
     let source_dir = tempfile::TempDir::new().unwrap();
     // 1MB spans many 64KB chunks, so this exercises the framing loop
-    let test_file = create_test_file(source_dir.path(), "large.bin", 1024 * 1024).await;
-    let expected = fs::read(&test_file).await.unwrap();
+    let (test_file, expected) = create_test_file(source_dir.path(), "large.bin", 1024 * 1024).await;
 
     let result = send_file(&peer, &test_file, "Sender").await;
 
