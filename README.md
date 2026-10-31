@@ -6,19 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-```console
-$ rustdrop list-peers
-Discovered peers:
---------------------------------------------------
-  [1] Amine-Laptop
-      IP: 192.168.1.42 | Port: 9000 | Fingerprint: 3f9a0c11
---------------------------------------------------
-
-$ rustdrop send report.pdf --to Laptop
-INFO Sending 'report.pdf' (2451 KB) to 'Amine-Laptop'
-INFO Sent 100%
-INFO File 'report.pdf' sent successfully!
-```
+![RustDrop: a file sent between two devices on the same network](docs/demo.gif)
 
 ## Why I built it
 

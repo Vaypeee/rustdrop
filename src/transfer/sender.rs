@@ -49,7 +49,7 @@ pub async fn send_file(peer: &Peer, file_path: &Path, sender_name: &str) -> Resu
     let mut reader = BufReader::new(file);
     let mut buffer = vec![0u8; CHUNK_SIZE];
     let mut sent: u64 = 0;
-    let mut last_progress = 0;
+    let mut last_tenth = 0;
 
     loop {
         let bytes_read = reader.read(&mut buffer).await?;
@@ -62,7 +62,7 @@ pub async fn send_file(peer: &Peer, file_path: &Path, sender_name: &str) -> Resu
             .map_err(protocol_to_rustdrop)?;
 
         sent += bytes_read as u64;
-        report_progress(sent, file_size, &mut last_progress);
+        report_progress(sent, file_size, &mut last_tenth);
     }
 
     write_end_of_stream(&mut tls_stream)
@@ -167,16 +167,19 @@ async fn await_completion(stream: &mut TlsStream<TcpStream>) -> Result<()> {
     }
 }
 
-/// Log transfer progress every 10%
-fn report_progress(done: u64, total: u64, last_progress: &mut u8) {
+/// Log transfer progress once per 10% crossed.
+///
+/// Chunks rarely land on an exact multiple of ten, so this tracks which tenth
+/// of the file is done rather than testing the percentage for divisibility.
+fn report_progress(done: u64, total: u64, last_tenth: &mut u8) {
     if total == 0 {
         return;
     }
 
-    let progress = (done * 100 / total) as u8;
-    if progress > *last_progress && progress.is_multiple_of(10) {
-        info!("Sent {}%", progress);
-        *last_progress = progress;
+    let tenth = (done * 10 / total) as u8;
+    if tenth > *last_tenth {
+        *last_tenth = tenth;
+        info!("Sent {}%", tenth * 10);
     }
 }
 

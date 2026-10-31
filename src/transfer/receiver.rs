@@ -164,6 +164,8 @@ async fn handle_text_message(
     message: TextMessage,
     auto_accept: bool,
 ) -> Result<()> {
+    info!("Incoming message from '{}'", message.sender_name);
+
     let prompt = format!("Accept a message from '{}'?", message.sender_name);
 
     if !confirm(&prompt, auto_accept).await {
@@ -205,14 +207,14 @@ async fn receive_file(
 
     let mut file = File::create(&file_path).await?;
     let mut received: u64 = 0;
-    let mut last_progress = 0;
+    let mut last_tenth = 0;
 
     loop {
         match read_chunk(stream).await {
             Ok(Some(chunk)) => {
                 file.write_all(&chunk).await?;
                 received += chunk.len() as u64;
-                report_progress(received, request.file_size, &mut last_progress);
+                report_progress(received, request.file_size, &mut last_tenth);
             }
             Ok(None) => break,
             Err(e) => {
@@ -250,7 +252,7 @@ async fn receive_file(
 /// the runtime while other transfers are in flight.
 async fn confirm(prompt: &str, auto_accept: bool) -> bool {
     if auto_accept {
-        info!("Auto-accepting ({})", prompt);
+        info!("Auto-accepting");
         return true;
     }
 
@@ -338,16 +340,19 @@ fn url_pattern() -> regex_lite::Regex {
     regex_lite::Regex::new(r"(https?://[^\s]+)").expect("URL pattern is a valid regex")
 }
 
-/// Log transfer progress every 10%
-fn report_progress(done: u64, total: u64, last_progress: &mut u8) {
+/// Log transfer progress once per 10% crossed.
+///
+/// Chunks rarely land on an exact multiple of ten, so this tracks which tenth
+/// of the file is done rather than testing the percentage for divisibility.
+fn report_progress(done: u64, total: u64, last_tenth: &mut u8) {
     if total == 0 {
         return;
     }
 
-    let progress = (done * 100 / total) as u8;
-    if progress > *last_progress && progress.is_multiple_of(10) {
-        info!("Received {}%", progress);
-        *last_progress = progress;
+    let tenth = (done * 10 / total) as u8;
+    if tenth > *last_tenth {
+        *last_tenth = tenth;
+        info!("Received {}%", tenth * 10);
     }
 }
 
